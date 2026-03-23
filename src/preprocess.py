@@ -4,6 +4,7 @@ PDF ingestion, text cleaning, normalization, and chunking for the RAG pipeline.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Optional
 
@@ -14,16 +15,62 @@ try:
 except ImportError:  # pragma: no cover
     pymupdf = None
 
+logger = logging.getLogger(__name__)
+
+# Minimum character count to treat direct text extraction as successful (else try OCR).
+_MIN_EXTRACT_CHARS = 50
+
+
+def _extract_sufficient(text: str) -> bool:
+    """Return True when stripped text is long enough to skip further extraction."""
+    return len(text.strip()) >= _MIN_EXTRACT_CHARS
+
+
+def extract_text_via_ocr(path: str) -> str:
+    """
+    Pull text out of a scanned PDF by turning each page into an image and
+    running optical character recognition (OCR) on it.
+
+    Uses pdf2image to render pages and pytesseract to read text. Page texts
+    are joined with blank lines between them. If anything goes wrong (missing
+    tools, bad file, OCR failure), the function logs a warning and returns an
+    empty string instead of crashing.
+    """
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+    except ImportError as exc:
+        logger.warning(
+            "OCR unavailable (install pdf2image and pytesseract): %s", exc
+        )
+        return ""
+    try:
+        images = convert_from_path(path)
+    except Exception as exc:
+        logger.warning("pdf2image could not convert PDF %s: %s", path, exc)
+        return ""
+    parts: list[str] = []
+    for page_num, image in enumerate(images, start=1):
+        try:
+            page_text = pytesseract.image_to_string(image)
+            parts.append(page_text)
+        except Exception as exc:
+            logger.warning(
+                "pytesseract failed on page %s of %s: %s", page_num, path, exc
+            )
+    return "\n".join(parts)
+
 
 def extract_text_from_pdf(path: str) -> str:
     """
     Read a PDF file and return its text as one string.
 
-    The function tries PyMuPDF first because it is usually faster. If that
-    returns an empty string (some PDFs scan poorly with one library), it
-    falls back to pdfplumber so we still get usable text when possible.
+    Order of attempts: PyMuPDF (fast), then pdfplumber if the result is empty
+    or very short, then OCR for likely scanned PDFs when both still yield
+    fewer than 50 characters of text. Which method succeeded is logged at
+    info level for debugging.
     """
-    raw = ""
+    raw_pymupdf = ""
     if pymupdf is not None:
         try:
             doc = pymupdf.open(path)
@@ -31,17 +78,43 @@ def extract_text_from_pdf(path: str) -> str:
             for page in doc:
                 parts.append(page.get_text())
             doc.close()
-            raw = "\n".join(parts)
+            raw_pymupdf = "\n".join(parts)
         except OSError as exc:
             raise OSError(f"Could not read PDF with PyMuPDF: {path}") from exc
-    if raw.strip():
-        return raw
+
+    if _extract_sufficient(raw_pymupdf):
+        logger.info("PDF text extracted with pymupdf: %s", path)
+        return raw_pymupdf
+
+    raw_plumber = ""
     try:
         with pdfplumber.open(path) as pdf:
             pages = [p.extract_text() or "" for p in pdf.pages]
-        return "\n".join(pages)
+        raw_plumber = "\n".join(pages)
     except OSError as exc:
-        raise OSError(f"Could not read PDF with pdfplumber: {path}") from exc
+        logger.warning("pdfplumber could not read PDF %s: %s", path, exc)
+
+    if _extract_sufficient(raw_plumber):
+        logger.info("PDF text extracted with pdfplumber: %s", path)
+        return raw_plumber
+
+    ocr_text = extract_text_via_ocr(path)
+    if ocr_text.strip():
+        logger.info("PDF text extracted with OCR (pytesseract): %s", path)
+        return ocr_text
+
+    if raw_plumber.strip():
+        logger.info(
+            "PDF using short pdfplumber text (OCR did not add text): %s", path
+        )
+        return raw_plumber
+    if raw_pymupdf.strip():
+        logger.info(
+            "PDF using short pymupdf text (OCR did not add text): %s", path
+        )
+        return raw_pymupdf
+    logger.warning("No text extracted from PDF: %s", path)
+    return ""
 
 
 def _strip_non_ascii(text: str) -> str:
@@ -113,7 +186,7 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]
 
     Words are split on whitespace. Each chunk uses up to `chunk_size` words,
     and the next chunk starts `chunk_size - overlap` words later so nearby
-    ideas stay connected across chunks.     Short documents become a single chunk; empty input returns an empty list.
+    ideas stay connected across chunks. Short documents become a single chunk; empty input returns an empty list.
     For long text, each window uses up to `chunk_size` words; a very short
     trailing window may be merged into the prior chunk when that keeps the
     combined size within chunk_size plus a small margin, so small fragments
