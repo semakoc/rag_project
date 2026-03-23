@@ -71,11 +71,6 @@ Use a virtual environment with dev dependencies from `requirements.txt`.
 
 Routing sends each participant to the **opposing** group’s index so they hear how that side’s materials frame values and experiences. That mismatch is intentional: it supports empathy across groups rather than reinforcing one’s own talking points.
 
-## IRB and privacy
-
-- **Logging** (`logs/interactions.txt`) stores **metadata only**: timestamp, anonymous `session_id`, group, query/response **lengths**, and number of context chunks. **Raw query and response text are not logged** — to protect participant confidentiality under Protocol 26.0670.
-- **No PII** should be entered into the app for research use.
-- The **FAISS index is static** after build; there is no online learning from user input.
 
 ## Environment variables
 
